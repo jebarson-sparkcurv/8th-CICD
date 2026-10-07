@@ -1,0 +1,689 @@
+name: Production Deployment
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+
+  # ============================================================
+  # BUILD
+  # ============================================================
+
+  build:
+    name: Build Production Application
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # --------------------------------------------------------
+      # Checkout source code
+      # --------------------------------------------------------
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+
+      # --------------------------------------------------------
+      # Frontend
+      # --------------------------------------------------------
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Setup Yarn
+        run: corepack prepare yarn@1.22.22 --activate
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: yarn install --frozen-lockfile
+
+      - name: Build frontend
+        working-directory: frontend
+        run: yarn build
+
+
+      # --------------------------------------------------------
+      # Backend
+      # --------------------------------------------------------
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: pip install -r requirements.txt
+
+      - name: Test backend
+        working-directory: backend
+        run: python -m py_compile main.py
+
+
+      # ========================================================
+      # UPLOAD ARTIFACTS
+      # ========================================================
+
+      - name: Upload frontend build
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-frontend-build
+          path: frontend/dist
+
+      - name: Upload backend
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-backend-build
+          path: backend
+  # ============================================================
+  # PRODUCTION DEPLOYMENT
+  # ============================================================
+
+  deploy:
+    name: Deploy to Production
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ========================================================
+      # DOWNLOAD BUILD ARTIFACTS
+      # ========================================================
+
+      - name: Download frontend build
+        uses: actions/download-artifact@v4
+        with:
+          name: production-frontend-build
+          path: frontend-build
+
+      - name: Download backend
+        uses: actions/download-artifact@v4
+        with:
+          name: production-backend-build
+          path: backend-build
+
+
+      # ========================================================
+      # CHECK DOWNLOADED FILES
+      # ========================================================
+
+      - name: Check downloaded files
+        run: |
+          echo "Frontend files:"
+          ls -la frontend-build
+
+          echo "Backend files:"
+          ls -la backend-build
+      # ========================================================
+      # SSH
+      # ========================================================
+
+      - name: Setup production SSH key
+        run: |
+          mkdir -p ~/.ssh
+
+          echo "${{ secrets.PROD_EC2_SSH_KEY }}" > ~/.ssh/production-key
+
+          chmod 600 ~/.ssh/production-key
+
+
+      - name: Test production EC2 connection
+        run: |
+          ssh -i ~/.ssh/production-key \
+            -o StrictHostKeyChecking=no \
+            "${{ secrets.PROD_EC2_USER }}@${{ secrets.PROD_EC2_HOST }}" \
+            "echo 'Connected to Production EC2 successfully'"
+      # ========================================================
+      # PREPARE PRODUCTION EC2
+      # ========================================================
+
+      - name: Install required software on Production EC2
+        run: |
+          ssh -i ~/.ssh/production-key \
+            -o StrictHostKeyChecking=no \
+            "${{ secrets.PROD_EC2_USER }}@${{ secrets.PROD_EC2_HOST }}" \
+            "set -e
+
+            echo '======================================'
+            echo 'Preparing Production EC2'
+            echo '======================================'
+
+            PACKAGES=''
+
+            if ! command -v nginx >/dev/null 2>&1; then
+              echo 'NGINX is not installed.'
+              PACKAGES=\"\$PACKAGES nginx\"
+            else
+              echo 'NGINX already installed.'
+            fi
+
+            if ! command -v curl >/dev/null 2>&1; then
+              echo 'curl is not installed.'
+              PACKAGES=\"\$PACKAGES curl\"
+            else
+              echo 'curl already installed.'
+            fi
+
+            if ! command -v python3 >/dev/null 2>&1; then
+              echo 'Python3 is not installed.'
+              PACKAGES=\"\$PACKAGES python3\"
+            else
+              echo 'Python3 already installed.'
+            fi
+
+            if ! command -v pip3 >/dev/null 2>&1; then
+              echo 'pip3 is not installed.'
+              PACKAGES=\"\$PACKAGES python3-pip\"
+            else
+              echo 'pip3 already installed.'
+            fi
+
+            if ! dpkg -s python3-venv >/dev/null 2>&1; then
+              echo 'python3-venv is not installed.'
+              PACKAGES=\"\$PACKAGES python3-venv\"
+            else
+              echo 'python3-venv already installed.'
+            fi
+
+            if ! dpkg -s build-essential >/dev/null 2>&1; then
+              echo 'build-essential is not installed.'
+              PACKAGES=\"\$PACKAGES build-essential\"
+            else
+              echo 'build-essential already installed.'
+            fi
+
+            if [ -n \"\$PACKAGES\" ]; then
+
+              echo 'Installing missing packages:'
+              echo \"\$PACKAGES\"
+
+              sudo DEBIAN_FRONTEND=noninteractive apt-get update
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \$PACKAGES
+
+            else
+
+              echo 'All required packages are already installed.'
+
+            fi
+
+
+            echo '======================================'
+            echo 'Creating production directories'
+            echo '======================================'
+
+            sudo mkdir -p /var/www/cicd-app/releases
+            sudo mkdir -p /opt/cicd-app-backend/releases
+
+            sudo chown -R ubuntu:ubuntu \
+              /var/www/cicd-app \
+              /opt/cicd-app-backend
+
+
+            echo '======================================'
+            echo 'Preparing NGINX'
+            echo '======================================'
+
+            sudo systemctl enable nginx
+            sudo systemctl start nginx
+
+            echo 'NGINX is ready.'
+
+
+            echo '======================================'
+            echo 'Preparing backend systemd service'
+            echo '======================================'
+
+            if [ ! -f /etc/systemd/system/cicd-backend.service ]; then
+
+              echo 'Creating cicd-backend.service...'
+
+              sudo printf '%s\n' \
+                '[Unit]' \
+                'Description=CI/CD FastAPI Backend' \
+                'After=network.target' \
+                '' \
+                '[Service]' \
+                'User=ubuntu' \
+                'WorkingDirectory=/opt/cicd-app-backend/current' \
+                'ExecStart=/opt/cicd-app-backend/current/venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000' \
+                'Restart=always' \
+                'RestartSec=5' \
+                '' \
+                '[Install]' \
+                'WantedBy=multi-user.target' \
+                | sudo tee /etc/systemd/system/cicd-backend.service > /dev/null
+
+              echo 'Backend service created.'
+
+            else
+
+              echo 'Backend service already exists.'
+
+            fi
+
+            sudo systemctl daemon-reload
+            sudo systemctl enable cicd-backend
+
+
+            echo '======================================'
+            echo 'Verifying software'
+            echo '======================================'
+
+            python3 --version
+            pip3 --version
+            nginx -v
+            curl --version | head -n 1
+
+            sudo systemctl is-active --quiet nginx
+
+            echo '======================================'
+            echo 'Production EC2 preparation completed'
+            echo '======================================'
+            "
+      # ========================================================
+      # CAPTURE PREVIOUS PRODUCTION RELEASE
+      # ========================================================
+
+      - name: Capture previous production release
+        id: previous_release
+        run: |
+
+          PREVIOUS_FRONTEND=$(ssh -i ~/.ssh/production-key \
+            -o StrictHostKeyChecking=no \
+            "${{ secrets.PROD_EC2_USER }}@${{ secrets.PROD_EC2_HOST }}" \
+            "readlink -f /var/www/cicd-app/current || true")
+
+          PREVIOUS_BACKEND=$(ssh -i ~/.ssh/production-key \
+            -o StrictHostKeyChecking=no \
+            "${{ secrets.PROD_EC2_USER }}@${{ secrets.PROD_EC2_HOST }}" \
+            "readlink -f /opt/cicd-app-backend/current || true")
+
+
+          echo "Previous production frontend:"
+          echo "$PREVIOUS_FRONTEND"
+
+          echo "Previous production backend:"
+          echo "$PREVIOUS_BACKEND"
+
+
+          echo "previous_frontend=$PREVIOUS_FRONTEND" >> "$GITHUB_OUTPUT"
+
+          echo "previous_backend=$PREVIOUS_BACKEND" >> "$GITHUB_OUTPUT"
+      # ========================================================
+      # PREPARE NEW PRODUCTION RELEASE
+      # ========================================================
+
+      - name: Prepare production release directory
+        run: |
+          ssh -i ~/.ssh/production-key \
+            -o StrictHostKeyChecking=no \
+            "${{ secrets.PROD_EC2_USER }}@${{ secrets.PROD_EC2_HOST }}" \
+            "sudo mkdir -p \
+              /var/www/cicd-app/releases/${{ github.sha }} && \
+             sudo mkdir -p \
+              /opt/cicd-app-backend/releases/${{ github.sha }} && \
+             sudo chown -R ubuntu:ubuntu \
+              /var/www/cicd-app \
+              /opt/cicd-app-backend"
+      # ========================================================
+      # CONFIGURE NGINX
+      # ========================================================
+
+      - name: Configure production NGINX
+        run: |
+          ssh -i ~/.ssh/production-key \
+            -o StrictHostKeyChecking=no \
+            "${{ secrets.PROD_EC2_USER }}@${{ secrets.PROD_EC2_HOST }}" \
+            "sudo tee /etc/nginx/sites-available/cicd-app > /dev/null <<'EOF'
+          server {
+              listen 4000;
+              server_name _;
+
+              root /var/www/cicd-app/current;
+              index index.html;
+
+              location /api/ {
+                  proxy_pass http://127.0.0.1:8000/;
+
+                  proxy_set_header Host \$host;
+                  proxy_set_header X-Real-IP \$remote_addr;
+                  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto \$scheme;
+              }
+
+              location / {
+                  try_files \$uri \$uri/ /index.html;
+              }
+          }
+          EOF
+
+          sudo ln -sfn \
+            /etc/nginx/sites-available/cicd-app \
+            /etc/nginx/sites-enabled/cicd-app
+
+          sudo rm -f /etc/nginx/sites-enabled/default
+
+          sudo nginx -t
+
+          sudo systemctl reload nginx"
+      # ========================================================
+      # COPY FRONTEND
+      # ========================================================
+
+      - name: Copy frontend to Production EC2
+        run: |
+          scp -i ~/.ssh/production-key \
+            -o StrictHostKeyChecking=no \
+            -r frontend-build/* \
+            "${{ secrets.PROD_EC2_USER }}@${{ secrets.PROD_EC2_HOST }}:/var/www/cicd-app/releases/${{ github.sha }}/"
+
+
+      # ========================================================
+      # COPY BACKEND
+      # ========================================================
+
+      - name: Copy backend to Production EC2
+        run: |
+          scp -i ~/.ssh/production-key \
+            -o StrictHostKeyChecking=no \
+            -r backend-build/* \
+            "${{ secrets.PROD_EC2_USER }}@${{ secrets.PROD_EC2_HOST }}:/opt/cicd-app-backend/releases/${{ github.sha }}/"                                                                    
+      # ========================================================
+      # PREPARE BACKEND RUNTIME
+      # ========================================================
+
+      - name: Prepare production backend runtime
+        run: |
+          ssh -i ~/.ssh/production-key \
+            -o StrictHostKeyChecking=no \
+            "${{ secrets.PROD_EC2_USER }}@${{ secrets.PROD_EC2_HOST }}" \
+            "set -e
+
+            echo '======================================'
+            echo 'Creating Python virtual environment'
+            echo '======================================'
+
+            python3 -m venv \
+              /opt/cicd-app-backend/releases/${{ github.sha }}/venv
+
+
+            echo '======================================'
+            echo 'Upgrading pip'
+            echo '======================================'
+
+            /opt/cicd-app-backend/releases/${{ github.sha }}/venv/bin/pip \
+              install --upgrade pip
+
+
+            echo '======================================'
+            echo 'Installing backend dependencies'
+            echo '======================================'
+
+            /opt/cicd-app-backend/releases/${{ github.sha }}/venv/bin/pip \
+              install \
+              -r /opt/cicd-app-backend/releases/${{ github.sha }}/requirements.txt
+
+
+            echo '======================================'
+            echo 'Backend runtime prepared'
+            echo '======================================'
+            "
+      # ========================================================
+      # ACTIVATE NEW PRODUCTION RELEASE
+      # ========================================================
+
+      - name: Activate new production release
+        run: |
+          ssh -i ~/.ssh/production-key \
+            -o StrictHostKeyChecking=no \
+            "${{ secrets.PROD_EC2_USER }}@${{ secrets.PROD_EC2_HOST }}" \
+            "sudo ln -sfn \
+              /var/www/cicd-app/releases/${{ github.sha }} \
+              /var/www/cicd-app/current && \
+             sudo ln -sfn \
+              /opt/cicd-app-backend/releases/${{ github.sha }} \
+              /opt/cicd-app-backend/current"
+      # ========================================================
+      # RESTART PRODUCTION BACKEND
+      # ========================================================
+
+      - name: Restart production backend
+        run: |
+          ssh -i ~/.ssh/production-key \
+            -o StrictHostKeyChecking=no \
+            "${{ secrets.PROD_EC2_USER }}@${{ secrets.PROD_EC2_HOST }}" \
+            "sudo systemctl daemon-reload && \
+             sudo systemctl restart cicd-backend && \
+             sudo systemctl is-active --quiet cicd-backend"
+      # ========================================================
+      # PRODUCTION HEALTH CHECK
+      # ========================================================
+
+      - name: Production health check
+        run: |
+          ssh -i ~/.ssh/production-key \
+            -o StrictHostKeyChecking=no \
+            "${{ secrets.PROD_EC2_USER }}@${{ secrets.PROD_EC2_HOST }}" \
+            "set -e
+
+            echo '======================================'
+            echo 'Checking backend service'
+            echo '======================================'
+
+            sudo systemctl is-active --quiet cicd-backend
+
+            echo 'Backend service is running.'
+
+
+            echo '======================================'
+            echo 'Checking backend health'
+            echo '======================================'
+
+            curl -f http://127.0.0.1:8000/health
+
+            echo
+            echo 'Backend health check passed.'
+
+
+            echo '======================================'
+            echo 'Checking production API'
+            echo '======================================'
+
+            curl -f http://127.0.0.1:4000/api/health
+
+            echo
+            echo 'Production API health check passed.'
+
+
+            echo '======================================'
+            echo 'Checking production frontend'
+            echo '======================================'
+
+            curl -f http://127.0.0.1:4000
+
+            echo
+            echo 'Production frontend health check passed.'
+
+
+            echo '======================================'
+            echo 'PRODUCTION HEALTH CHECK PASSED'
+            echo '======================================'
+            "
+      # ========================================================
+      # PRODUCTION ROLLBACK
+      # ========================================================
+
+      - name: Rollback production deployment
+        if: failure() && steps.previous_release.outputs.previous_frontend != ''
+        run: |
+
+          echo "======================================"
+          echo "PRODUCTION DEPLOYMENT FAILED"
+          echo "======================================"
+
+          echo "Starting automatic rollback..."
+
+          echo "Previous frontend:"
+          echo "${{ steps.previous_release.outputs.previous_frontend }}"
+
+          echo "Previous backend:"
+          echo "${{ steps.previous_release.outputs.previous_backend }}"
+
+
+          ssh -i ~/.ssh/production-key \
+            -o StrictHostKeyChecking=no \
+            "${{ secrets.PROD_EC2_USER }}@${{ secrets.PROD_EC2_HOST }}" \
+            "set -e
+
+            echo '======================================'
+            echo 'Restoring previous frontend'
+            echo '======================================'
+
+            sudo ln -sfn \
+              '${{ steps.previous_release.outputs.previous_frontend }}' \
+              /var/www/cicd-app/current
+
+
+            echo '======================================'
+            echo 'Restoring previous backend'
+            echo '======================================'
+
+            sudo ln -sfn \
+              '${{ steps.previous_release.outputs.previous_backend }}' \
+              /opt/cicd-app-backend/current
+
+
+            echo '======================================'
+            echo 'Restarting backend'
+            echo '======================================'
+
+            sudo systemctl daemon-reload
+
+            sudo systemctl restart cicd-backend
+
+            sudo systemctl is-active --quiet cicd-backend
+
+
+            echo '======================================'
+            echo 'ROLLBACK COMPLETED'
+            echo '======================================'
+            "
+      # ========================================================
+      # VERIFY PRODUCTION ROLLBACK
+      # ========================================================
+
+      - name: Verify production rollback
+        if: failure() && steps.previous_release.outputs.previous_frontend != ''
+        run: |
+
+          echo "======================================"
+          echo "VERIFYING PRODUCTION ROLLBACK"
+          echo "======================================"
+
+
+          ssh -i ~/.ssh/production-key \
+            -o StrictHostKeyChecking=no \
+            "${{ secrets.PROD_EC2_USER }}@${{ secrets.PROD_EC2_HOST }}" \
+            "set -e
+
+            echo 'Checking backend service...'
+
+            sudo systemctl is-active --quiet cicd-backend
+
+            echo 'Backend service is healthy.'
+
+
+            echo 'Checking backend health...'
+
+            curl -f http://127.0.0.1:8000/health
+
+            echo
+            echo 'Backend rollback health check passed.'
+
+
+            echo 'Checking API...'
+
+            curl -f http://127.0.0.1:4000/api/health
+
+            echo
+            echo 'API rollback health check passed.'
+
+
+            echo 'Checking frontend...'
+
+            curl -f http://127.0.0.1:4000
+
+            echo
+            echo 'Frontend rollback health check passed.'
+
+
+            echo '======================================'
+            echo 'ROLLBACK VERIFICATION SUCCESSFUL'
+            echo '======================================'
+            "
+      # ========================================================
+      # NOTIFY PROJECT MANAGER
+      # ========================================================
+
+      - name: Notify Project Manager
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+        run: |
+
+          echo "Creating production deployment failure issue..."
+
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "🚨 Production deployment failed - ${{ github.sha }}" \
+            --body "Production deployment failed.
+
+          Project Manager:
+          @jeberson1243
+
+          Repository:
+          ${{ github.repository }}
+
+          Commit:
+          ${{ github.sha }}
+
+          Branch:
+          main
+
+          Workflow:
+          ${{ github.workflow }}
+
+          Run:
+          ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          Previous frontend release:
+          ${{ steps.previous_release.outputs.previous_frontend }}
+
+          Previous backend release:
+          ${{ steps.previous_release.outputs.previous_backend }}
+
+          Automatic rollback was attempted.
+
+          Please investigate the failed production deployment."
+      - name: Production deployment successful
+        if: success()
+        run: |
+          echo "========================================"
+          echo "✅ PRODUCTION DEPLOYMENT SUCCESSFUL"
+          echo "========================================"
+          echo "Commit: ${{ github.sha }}"
+          echo "Branch: main"
+          echo "Production application is LIVE."
+          echo "========================================"                                                                                                 
