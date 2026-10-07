@@ -153,6 +153,10 @@ jobs:
       # PREPARE TESTING EC2
       # ========================================================
 
+           # ========================================================
+      # PREPARE TESTING EC2
+      # ========================================================
+
       - name: Install required software on EC2
         run: |
           ssh -i ~/.ssh/github-actions \
@@ -203,7 +207,7 @@ jobs:
               echo 'python3-venv already installed.'
             fi
 
-            if ! command -v gcc >/dev/null 2>&1; then
+            if ! dpkg -s build-essential >/dev/null 2>&1; then
               echo 'build-essential is not installed.'
               PACKAGES=\"\$PACKAGES build-essential\"
             else
@@ -211,11 +215,13 @@ jobs:
             fi
 
             if [ -n \"\$PACKAGES\" ]; then
-              echo 'Installing missing packages:'
+              echo '======================================'
+              echo 'Installing missing packages'
               echo \"\$PACKAGES\"
+              echo '======================================'
 
-              sudo apt-get update
-              sudo apt-get install -y \$PACKAGES
+              sudo DEBIAN_FRONTEND=noninteractive apt-get update
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \$PACKAGES
             else
               echo 'All required packages are already installed.'
             fi
@@ -250,24 +256,21 @@ jobs:
 
               echo 'Creating cicd-backend.service...'
 
-              sudo tee /etc/systemd/system/cicd-backend.service > /dev/null <<'SERVICE'
-            [Unit]
-            Description=CI/CD FastAPI Backend
-            After=network.target
-
-            [Service]
-            User=ubuntu
-            WorkingDirectory=/opt/cicd-app-backend/current
-            ExecStart=/opt/cicd-app-backend/current/venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000
-            Restart=always
-            RestartSec=5
-
-            [Install]
-            WantedBy=multi-user.target
-            SERVICE
-
-              sudo systemctl daemon-reload
-              sudo systemctl enable cicd-backend
+              sudo printf '%s\n' \
+                '[Unit]' \
+                'Description=CI/CD FastAPI Backend' \
+                'After=network.target' \
+                '' \
+                '[Service]' \
+                'User=ubuntu' \
+                'WorkingDirectory=/opt/cicd-app-backend/current' \
+                'ExecStart=/opt/cicd-app-backend/current/venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000' \
+                'Restart=always' \
+                'RestartSec=5' \
+                '' \
+                '[Install]' \
+                'WantedBy=multi-user.target' \
+                | sudo tee /etc/systemd/system/cicd-backend.service > /dev/null
 
               echo 'cicd-backend.service created.'
 
@@ -275,10 +278,10 @@ jobs:
 
               echo 'cicd-backend.service already exists.'
 
-              sudo systemctl daemon-reload
-              sudo systemctl enable cicd-backend
-
             fi
+
+            sudo systemctl daemon-reload
+            sudo systemctl enable cicd-backend
 
             echo '======================================'
             echo 'Testing installed software'
@@ -308,7 +311,6 @@ jobs:
             echo 'EC2 preparation completed'
             echo '======================================'
             "
-
 
       # ========================================================
       # CAPTURE PREVIOUS RELEASE
