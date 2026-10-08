@@ -1,16 +1,12 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 
 app = FastAPI()
 
-
 @app.get("/")
 def root():
-    return {"message": "Shopping Backend - Version 7"}
-
+    return {"message": "Shopping Backend - Version 6"}
 
 @app.get("/health")
 def health():
-    raise HTTPException(
-        status_code=500,
-        detail="V7 intentional health check failure"
-    )
+    return {"status": "healthy"}
+
