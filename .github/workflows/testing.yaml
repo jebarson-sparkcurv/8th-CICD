@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - developer
+concurrency:
+  group: testing-deployment
+  cancel-in-progress: true
 
 permissions:
   contents: read
