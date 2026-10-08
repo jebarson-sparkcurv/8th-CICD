@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
   issues: write
+  
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
 
 jobs:
 
